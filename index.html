@@ -922,7 +922,7 @@ select.field-input { appearance: none; background-image: url("data:image/svg+xml
     <div>
       <div class="settings-section-title">Über</div>
       <div class="settings-card">
-        <div class="settings-row"><div class="settings-row-label">Version</div><div style="font-size:13px;font-weight:600;color:var(--ink)">2.2.1</div></div>
+        <div class="settings-row"><div class="settings-row-label">Version</div><div style="font-size:13px;font-weight:600;color:var(--ink)">2.1.0</div></div>
         <div class="settings-row"><div class="settings-row-label">KI-Modell</div><div style="font-size:11px;font-weight:600;font-family:var(--font-mono);color:var(--ink3)">llama-3.3-70b-versatile</div></div>
         <div class="settings-row" style="border-bottom:none">
           <div class="settings-row-label">Datenschutz</div>
@@ -1136,7 +1136,6 @@ function startAnalysis() {
   if (!getApiKey()) { showToast('Bitte zuerst API Key eintragen'); navTo('settings'); return; }
   const url = urlInput.value.trim();
   const caption = document.getElementById('caption-input').value.trim();
-  if (url && !caption) { showToast('Tipp: Wenn das Rezept in der Videobeschreibung steht, bitte den Text in „Beschreibung / Caption“ einfügen (automatisches Auslesen vom Link ist im Browser meist blockiert).', 4200); }
   if (!url && !caption && !selectedFile) { showToast('Bitte Link, Text oder Video eingeben'); return; }
   if (url && !url.startsWith('http')) { showToast('Link muss mit https:// beginnen'); return; }
   const parts = [];
@@ -1157,7 +1156,6 @@ const STAGES_DEF = [
   { key:'input_check',   icon:'🔍', label:'Eingabe prüfen',         detail:'URL · Text · Datei' },
   { key:'audio_extract', icon:'🔊', label:'Audio extrahieren',       detail:'Browser · Direktmodus' },
   { key:'transcribe',    icon:'🎙️', label:'Transkription',           detail:'Groq Whisper' },
-  { key:'ocr_frames',   icon:'👁️', label:'Text aus Video lesen',     detail:'OCR · Stichproben' },
   { key:'merge',         icon:'🧩', label:'Signale zusammenführen',  detail:'Caption + Transkript' },
   { key:'extract',       icon:'🤖', label:'Rezept extrahieren',      detail:'Llama 3.3 70B' },
   { key:'validate',      icon:'✅', label:'Anti-Halluzination',      detail:'Mengen & Einheiten prüfen' },
@@ -1218,7 +1216,7 @@ async function runPipeline(url, caption, file) {
 
   const hasFile = !!file;
   const stageKeys = ['input_check'];
-  if (hasFile) stageKeys.push('audio_extract', 'transcribe', 'ocr_frames');
+  if (hasFile) stageKeys.push('audio_extract', 'transcribe');
   stageKeys.push('merge', 'extract', 'validate', 'save');
   buildPipelineUI(stageKeys);
   stageKeys.forEach(k => setStage(k, 'idle'));
@@ -1273,35 +1271,12 @@ async function runPipeline(url, caption, file) {
       setProgress(55);
     }
 
-
-// OCR (Frames) — nur wenn Caption/Transcript zu dünn sind
-let ocrText = '';
-if (hasFile) {
-  setStage('ocr_frames', 'active');
-  setStatus('Text wird aus Video gelesen (OCR)…');
-  try {
-    const shouldOcr = (!caption || caption.length < 40) && (!transcript || transcript.length < 60);
-    if (shouldOcr) {
-      ocrText = await ocrFramesFromVideo(file, { frames: 6, lang: 'deu+eng' });
-      dbg('stage', 'OCR ✓', { chars: ocrText.length, preview: ocrText.slice(0, 200) });
-      setStage('ocr_frames', ocrText ? 'done' : 'skip');
-    } else {
-      dbg('stage', 'OCR — übersprungen (genug Text vorhanden)', { caption_chars: caption.length, transcript_chars: transcript.length });
-      setStage('ocr_frames', 'skip');
-    }
-  } catch (e) {
-    dbg('error', 'OCR fehlgeschlagen', e?.message || String(e));
-    setStage('ocr_frames', 'skip');
-  }
-  setProgress(60);
-}
-
     // MERGE
     setStage('merge', 'active');
     setStatus('Signale werden zusammengeführt…');
     await delay(200);
     const langPref = getSettings().language_pref || 'original';
-    const mergedContext = buildContext(url, caption, transcript, langPref, ocrText);
+    const mergedContext = buildContext(url, caption, transcript, langPref);
     dbg('stage', 'MERGE ✓', {url:!!url, caption_chars:caption.length, transcript_chars:transcript.length, total_chars:mergedContext.length, preview:mergedContext.slice(0,300)});
     setStage('merge', 'done');
     setProgress(65);
@@ -1373,204 +1348,10 @@ if (hasFile) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-let _tesseractLoading = null;
-async function loadTesseract() {
-  if (window.Tesseract) return window.Tesseract;
-  if (_tesseractLoading) return _tesseractLoading;
-  _tesseractLoading = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-    s.async = true;
-    s.onload = () => resolve(window.Tesseract);
-    s.onerror = () => reject(new Error('Tesseract.js konnte nicht geladen werden'));
-    document.head.appendChild(s);
-  });
-  return _tesseractLoading;
-}
-
-function _normOcrText(input) {
-  // Normalisiert OCR-Text und filtert typisches Rauschen (Artefakte, UI-Icons, zufällige Zeichen).
-  const raw = String(input || '')
-    .replace(/\u00A0/g, ' ')
-    .replace(/[\r\f\v]/g, '\n')
-    .replace(/[\t ]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n');
-
-  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
-
-  // Heuristik: behalte Zeilen, die "sprachlich" aussehen.
-  const keep = [];
-  const seen = new Set();
-  for (let line of lines) {
-    // Entferne lange reine Sonderzeichen-Folgen
-    line = line.replace(/[•·●▪︎◦]/g, ' ').replace(/[‘’]/g, "'").replace(/[“”„]/g, '"').trim();
-    if (!line) continue;
-
-    const letters = (line.match(/[A-Za-zÄÖÜäöüß]/g) || []).length;
-    const digits  = (line.match(/[0-9]/g) || []).length;
-    const total   = line.length;
-    const ratio   = total ? (letters + digits) / total : 0;
-
-    // Zu kurze oder sehr "symbolische" Zeilen raus
-    if (total < 8) continue;
-    if (ratio < 0.55) continue;
-
-    // Dedupe auf "kanonischer" Form
-    const key = line.toLowerCase().replace(/[^a-z0-9äöüß]+/gi, ' ').trim();
-    if (!key || key.length < 10) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    keep.push(line);
-  }
-
-  // Wenn alles weggefiltert wurde, fallback auf raw (aber getrimmt)
-  const out = (keep.length ? keep.join('\n') : raw).trim();
-
-  // Letztes Glätten
-  return out
-    .replace(/[ ]{2,}/g, ' ')
-    .replace(/\n[ ]+/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function _ocrScore(t){
-  const s=String(t||'');
-  const letters=(s.match(/[A-Za-zÄÖÜäöüß]/g)||[]).length;
-  const digits=(s.match(/[0-9]/g)||[]).length;
-  const total=s.length||1;
-  // leichter Bonus für mehrere Wörter
-  const words=(s.trim().split(/\s+/).filter(Boolean)).length;
-  return ((letters+digits)/total) + Math.min(0.25, words/80);
-}
-
-async function ocrFramesFromVideo(file, opts = {}) {
-  const frames = Math.max(3, Math.min(10, Number(opts.frames || 6)));
-  const lang = String(opts.lang || 'deu+eng');
-  const maxChars = Math.max(800, Math.min(6000, Number(opts.maxChars || 2200)));
-
-  const T = await loadTesseract();
-  if (!T) throw new Error('Tesseract ist nicht verfügbar');
-
-  const url = URL.createObjectURL(file);
-  const video = document.createElement('video');
-  video.src = url;
-  video.muted = true;
-  video.playsInline = true;
-  video.crossOrigin = 'anonymous';
-
-  await new Promise((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error('Video konnte nicht geladen werden'));
-  });
-
-  const duration = Number(video.duration || 0);
-  if (!duration || !isFinite(duration)) {
-    URL.revokeObjectURL(url);
-    throw new Error('Unbekannte Videolänge');
-  }
-
-  // Canvas vorbereiten (max ~960px Breite für Speed)
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const vw = video.videoWidth || 1280;
-  const vh = video.videoHeight || 720;
-  const targetW = Math.min(960, vw);
-  const scale = targetW / vw;
-  canvas.width = Math.round(vw * scale);
-  canvas.height = Math.round(vh * scale);
-
-  // Worker (schneller + stabiler)
-  const worker = await (T.createWorker ? T.createWorker(lang) : null);
-  if (worker) {
-    await worker.loadLanguage(lang);
-    await worker.initialize(lang);
-    try { await worker.setParameters({ tessedit_pageseg_mode: 6, preserve_interword_spaces: '1' }); } catch {}
-  }
-
-  const texts = [];
-  for (let i = 1; i <= frames; i++) {
-    const t = (duration * i) / (frames + 1);
-    await new Promise((resolve, reject) => {
-      const onSeeked = () => { cleanup(); resolve(); };
-      const onErr = () => { cleanup(); reject(new Error('Seek fehlgeschlagen')); };
-      const cleanup = () => {
-        video.removeEventListener('seeked', onSeeked);
-        video.removeEventListener('error', onErr);
-      };
-      video.addEventListener('seeked', onSeeked);
-      video.addEventListener('error', onErr);
-      try { video.currentTime = Math.max(0, Math.min(duration - 0.05, t)); }
-      catch (e) { cleanup(); reject(e); }
-    });
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    // Wir testen zwei Varianten: Vollbild + Center-Crop (oft sind Captions zentral).
-    const dataUrlFull = canvas.toDataURL('image/png', 0.92);
-
-    // Center-Crop vorbereiten (10% Rand abschneiden)
-    const crop = document.createElement('canvas');
-    const cctx = crop.getContext('2d', { willReadFrequently: true });
-    const mx = Math.round(canvas.width * 0.10);
-    const my = Math.round(canvas.height * 0.10);
-    const cw = Math.max(1, canvas.width - mx * 2);
-    const ch = Math.max(1, canvas.height - my * 2);
-    crop.width = cw;
-    crop.height = ch;
-    cctx.drawImage(canvas, mx, my, cw, ch, 0, 0, cw, ch);
-    const dataUrlCrop = crop.toDataURL('image/png', 0.92);
-
-    async function recog(dataUrl){
-      if (worker) {
-        const { data } = await worker.recognize(dataUrl);
-        return data?.text || '';
-      } else {
-        const res = await T.recognize(dataUrl, lang);
-        return res?.data?.text || '';
-      }
-    }
-
-    let outFull = await recog(dataUrlFull);
-    let outCrop = await recog(dataUrlCrop);
-
-    // Wähle die "lesbarere" Variante
-    const normFull = _normOcrText(outFull);
-    const normCrop = _normOcrText(outCrop);
-    let out = (_ocrScore(normCrop) > _ocrScore(normFull)) ? normCrop : normFull;
-
-    out = _normOcrText(out);
-    if (out && out.length >= 12) texts.push(out);
-
-    // UI-Feedback grob
-    setStatus(`Text wird aus Video gelesen (OCR)… ${i}/${frames}`);
-    if (pipelineAborted) break;
-  }
-
-  try { if (worker) await worker.terminate(); } catch {}
-  URL.revokeObjectURL(url);
-
-  // Dedupe + limit
-  const uniq = [];
-  const seen = new Set();
-  for (const t of texts) {
-    const key = t.toLowerCase().replace(/[^a-z0-9äöüß]+/gi, ' ').trim();
-    if (!key || key.length < 20) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniq.push(t);
-  }
-
-  const merged = _normOcrText(uniq.join('\n\n'));
-  return merged.length > maxChars ? merged.slice(0, maxChars) + '…' : merged;
-}
-
-function buildContext(url, caption, transcript, langPref = 'original', ocrText = '') {
+function buildContext(url, caption, transcript, langPref = 'original') {
   const parts = [];
   if (caption) parts.push('CAPTION/BESCHREIBUNG:\n' + caption);
   if (transcript) parts.push('TRANSKRIPT (Audio):\n' + transcript);
-  if (ocrText) parts.push('TEXT AUS VIDEO (OCR):\n' + ocrText);
   if (url) parts.push('QUELLE-URL: ' + url);
   if (langPref && langPref !== 'original') {
     parts.push('AUSGABESPRACHE: Übersetze alle Zutaten, Schritte und Tags ins ' + (langPref === 'de' ? 'Deutsche' : langPref === 'en' ? 'Englische' : langPref) + '.');
@@ -1728,7 +1509,6 @@ ABSOLUTE REGELN:
 3. ERFINDE KEINE Schritte die nicht im Text stehen
 4. ERFINDE KEINE Temperaturen, Zeiten, Zutaten
 5. Antworte NUR mit validem JSON
-6. Wenn KEINE konkreten Zutaten ODER KEINE konkreten Schritte im Text stehen (nur Teaser wie „3 Zutaten“), setze is_recipe: false ODER confidence <= 0.3 und lasse ingredients/steps leer.
 
 Gib aus:
 {
@@ -1753,8 +1533,7 @@ WICHTIG:
 - Extrahiere auch gesprochene Mengenangaben (z.B. "eine Tasse", "30 Stück", "15 Gramm", "ein Esslöffel") als amount+unit.
 - Extrahiere servings aus Aussagen wie "ne vengono una trentina" → servings: 30, oder "per 4 persone" → servings: 4.
 - Extrahiere duration_min aus Aussagen wie "un'ora" → 60, "20 minuti" → 20, "30 minutes" → 30.
-- Behalte die Originalsprache des Textes für Zutaten und Schritte bei.
-- Nutze OCR-Text nur, wenn er klar lesbar ist. Ignoriere offensichtliches Rauschen/Sonderzeichen.`;
+- Behalte die Originalsprache des Textes für Zutaten und Schritte bei.`;
   return callGroq([{ role:'system', content:system }, { role:'user', content:user }]);
 }
 
